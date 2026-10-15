@@ -1,5 +1,12 @@
 import React, { useState } from 'react';
-import { ShieldCheck, AlertTriangle, AlertOctagon, HelpCircle } from 'lucide-react';
+import {
+  ShieldCheck,
+  AlertTriangle,
+  AlertOctagon,
+  HelpCircle,
+  Activity,
+  UserX,
+} from 'lucide-react';
 import { MOCK_CURRENT_STATUS } from '../mock/mockData';
 
 export default function FallStatusCard({
@@ -7,7 +14,6 @@ export default function FallStatusCard({
   isLiveActive = false,
   apiError = null,
 }) {
-  // Demonstration state switcher allowing evaluators to preview all 3 alert visual designs when live camera is off
   const [demoState, setDemoState] = useState('NORMAL');
 
   const statusConfigs = {
@@ -47,30 +53,92 @@ export default function FallStatusCard({
 
   let current;
   if (isLive) {
-    const isFall = Boolean(livePrediction.fall_detected);
-    current = {
-      className: isFall ? 'status-banner-danger' : 'status-banner-normal',
-      iconClass: isFall ? 'danger' : 'normal',
-      icon: isFall ? AlertOctagon : ShieldCheck,
-      title: isFall ? 'EMERGENCY - Fall Detected!' : 'NORMAL - Safe Posture',
-      subtitle:
-        livePrediction.message ||
-        (isFall
-          ? 'High-confidence horizontal collapse detected by Random Forest model.'
-          : 'Subject is upright, seated, or moving within normal parameters.'),
-      posture: isFall ? 'Fallen / Ground Level Posture' : 'Upright / ADL Mobility',
-      confidence:
-        typeof livePrediction.confidence === 'number'
-          ? `${(livePrediction.confidence * 100).toFixed(1)}%`
-          : '95.0%',
-      fallProb:
-        typeof livePrediction.fall_probability === 'number'
-          ? `${(livePrediction.fall_probability * 100).toFixed(1)}%`
-          : isFall
-          ? '95.0%'
-          : '5.0%',
-      featuresCount: livePrediction.features_extracted || 47,
-    };
+    const isFallConfirmed = Boolean(livePrediction.fall_confirmed || livePrediction.fall_detected);
+    const isNearFall = Boolean(livePrediction.near_fall) && !isFallConfirmed;
+    const hasImmobility = Boolean(livePrediction.post_fall_immobility);
+
+    if (hasImmobility) {
+      current = {
+        className: 'status-banner-danger',
+        iconClass: 'danger',
+        icon: UserX,
+        title: 'CRITICAL - Post-Fall Immobility!',
+        subtitle: 'Subject has remained motionless on floor for >5 seconds after collapse.',
+        posture: 'Stationary / Immobility Detected',
+        confidence: '99.0%',
+        fallProb: '99.0%',
+        featuresCount: livePrediction.features_extracted || 47,
+        trackerState: livePrediction.tracker_state || 'FALL_ACTIVE',
+        isNearFall: false,
+        hasImmobility: true,
+      };
+    } else if (isFallConfirmed) {
+      current = {
+        className: 'status-banner-danger',
+        iconClass: 'danger',
+        icon: AlertOctagon,
+        title: 'EMERGENCY - Fall Confirmed!',
+        subtitle:
+          livePrediction.message ||
+          'High-confidence horizontal collapse confirmed by Random Forest temporal engine.',
+        posture: 'Fallen / Ground Level Posture',
+        confidence:
+          typeof livePrediction.confidence === 'number'
+            ? `${(livePrediction.confidence * 100).toFixed(1)}%`
+            : '95.0%',
+        fallProb:
+          typeof livePrediction.fall_probability === 'number'
+            ? `${(livePrediction.fall_probability * 100).toFixed(1)}%`
+            : '95.0%',
+        featuresCount: livePrediction.features_extracted || 47,
+        trackerState: livePrediction.tracker_state || 'FALL_ACTIVE',
+        isNearFall: false,
+        hasImmobility: false,
+      };
+    } else if (isNearFall) {
+      current = {
+        className: 'status-banner-warning',
+        iconClass: 'warning',
+        icon: AlertTriangle,
+        title: 'WARNING - Near-Fall Tilt Detected',
+        subtitle: 'Substantial torso deviation (40°-65°) detected without full collapse.',
+        posture: 'Postural Tilt / Wobble',
+        confidence:
+          typeof livePrediction.confidence === 'number'
+            ? `${(livePrediction.confidence * 100).toFixed(1)}%`
+            : '78.0%',
+        fallProb:
+          typeof livePrediction.fall_probability === 'number'
+            ? `${(livePrediction.fall_probability * 100).toFixed(1)}%`
+            : '45.0%',
+        featuresCount: livePrediction.features_extracted || 47,
+        trackerState: livePrediction.tracker_state || 'MONITORING',
+        isNearFall: true,
+        hasImmobility: false,
+      };
+    } else {
+      current = {
+        className: 'status-banner-normal',
+        iconClass: 'normal',
+        icon: ShieldCheck,
+        title: 'NORMAL - Safe Posture',
+        subtitle:
+          livePrediction.message || 'Subject is upright, seated, or moving within normal parameters.',
+        posture: 'Upright / ADL Mobility',
+        confidence:
+          typeof livePrediction.confidence === 'number'
+            ? `${(livePrediction.confidence * 100).toFixed(1)}%`
+            : '95.0%',
+        fallProb:
+          typeof livePrediction.fall_probability === 'number'
+            ? `${(livePrediction.fall_probability * 100).toFixed(1)}%`
+            : '5.0%',
+        featuresCount: livePrediction.features_extracted || 47,
+        trackerState: livePrediction.tracker_state || 'MONITORING',
+        isNearFall: false,
+        hasImmobility: false,
+      };
+    }
   } else {
     current = statusConfigs[demoState];
   }
@@ -85,18 +153,57 @@ export default function FallStatusCard({
           <span>Real-Time Fall Telemetry</span>
         </h2>
         {isLive ? (
-          <span
-            className="badge"
-            style={{
-              backgroundColor: current.iconClass === 'danger' ? 'rgba(239, 68, 68, 0.2)' : 'rgba(16, 185, 129, 0.2)',
-              color: current.iconClass === 'danger' ? '#f87171' : '#34d399',
-              border: current.iconClass === 'danger' ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid rgba(52, 211, 153, 0.4)',
-              fontWeight: 600,
-            }}
-            title="Active inference stream from FastAPI"
-          >
-            [LIVE ML PREDICTION - FastAPI]
-          </span>
+          <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'center' }}>
+            {current.trackerState && (
+              <span
+                className="badge"
+                style={{
+                  backgroundColor:
+                    current.trackerState === 'FALL_ACTIVE'
+                      ? 'rgba(239, 68, 68, 0.25)'
+                      : current.trackerState === 'CONFIRMING'
+                      ? 'rgba(249, 115, 22, 0.25)'
+                      : 'rgba(56, 189, 248, 0.2)',
+                  color:
+                    current.trackerState === 'FALL_ACTIVE'
+                      ? '#f87171'
+                      : current.trackerState === 'CONFIRMING'
+                      ? '#fb923c'
+                      : '#38bdf8',
+                  fontSize: '0.72rem',
+                }}
+              >
+                State: {current.trackerState}
+              </span>
+            )}
+            <span
+              className="badge"
+              style={{
+                backgroundColor:
+                  current.iconClass === 'danger'
+                    ? 'rgba(239, 68, 68, 0.2)'
+                    : current.iconClass === 'warning'
+                    ? 'rgba(245, 158, 11, 0.2)'
+                    : 'rgba(16, 185, 129, 0.2)',
+                color:
+                  current.iconClass === 'danger'
+                    ? '#f87171'
+                    : current.iconClass === 'warning'
+                    ? '#fbbf24'
+                    : '#34d399',
+                border:
+                  current.iconClass === 'danger'
+                    ? '1px solid rgba(239, 68, 68, 0.4)'
+                    : current.iconClass === 'warning'
+                    ? '1px solid rgba(245, 158, 11, 0.4)'
+                    : '1px solid rgba(52, 211, 153, 0.4)',
+                fontWeight: 600,
+              }}
+              title="Active inference stream from FastAPI"
+            >
+              [LIVE ML PREDICTION]
+            </span>
+          </div>
         ) : (
           <span className="badge badge-mock" title="Simulated visualization preview">
             [Simulated Telemetry]
@@ -138,7 +245,7 @@ export default function FallStatusCard({
         </div>
       </div>
 
-      {/* Live Stream Status or UI Showcase Demo Switcher */}
+      {/* Live Stream Telemetry Info or UI Showcase Switcher */}
       {isLiveActive ? (
         <div
           style={{
@@ -157,12 +264,13 @@ export default function FallStatusCard({
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
             <span className="pulse-dot" style={{ backgroundColor: '#10b981' }} aria-hidden="true" />
             <span>
-              <strong>Live Inference Stream Active:</strong> MediaPipe 33 landmarks streamed every ~650ms to FastAPI.
+              <strong>Temporal Confirmation Engine:</strong> 2 consecutive frames in &le;2.5s window
+              suppresses transient anomalies &amp; false alarms.
             </span>
           </div>
           {apiError && (
             <span style={{ color: '#fbbf24', fontSize: '0.76rem' }}>
-              Backend warning: {apiError}
+              Backend note: {apiError}
             </span>
           )}
         </div>

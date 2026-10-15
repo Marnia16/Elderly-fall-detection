@@ -667,3 +667,331 @@ def test_fall_probability_and_confidence_semantics(monkeypatch, tmp_path):
     res_amb = client.post("/api/predict", json=payload)
     data_amb = res_amb.json()
     assert data_amb["fall_probability"] is None
+
+
+def test_sqlite_persistence_and_crud():
+    """Verify SQLite database persistence across alerts endpoints."""
+    # 1. Create a test incident
+    create_payload = {
+        "patient_id": "test-patient-42",
+        "location": "Kitchen",
+        "severity": "HIGH",
+        "prediction_type": "RAPID_COLLAPSE",
+        "message": "Sudden descent detected near stove.",
+        "confidence": 0.93,
+        "fall_probability": 0.95,
+        "notes": "Initial telemetry capture",
+    }
+    res = client.post("/api/alerts", json=create_payload)
+    assert res.status_code == 201
+    created = res.json()
+    alert_id = created["id"]
+    assert created["patient_id"] == "test-patient-42"
+    assert created["status"] == "ACTIVE"
+    assert created["confidence"] == 0.93
+
+    # 2. Retrieve the incident by ID
+    res_get = client.get(f"/api/alerts/{alert_id}")
+    assert res_get.status_code == 200
+    assert res_get.json()["id"] == alert_id
+
+    # 3. Patch the incident
+    patch_payload = {"notes": "Caregiver en route", "escalated": True}
+    res_patch = client.patch(f"/api/alerts/{alert_id}", json=patch_payload)
+    assert res_patch.status_code == 200
+    assert res_patch.json()["notes"] == "Caregiver en route"
+    assert res_patch.json()["escalated"] is True
+
+    # 4. Filter list alerts
+    res_list = client.get("/api/alerts?status=ACTIVE&search=Kitchen")
+    assert res_list.status_code == 200
+    items = res_list.json()
+    assert any(i["id"] == alert_id for i in items)
+
+    # 5. Delete incident
+    res_del = client.delete(f"/api/alerts/{alert_id}")
+    assert res_del.status_code == 204
+    assert client.get(f"/api/alerts/{alert_id}").status_code == 404
+
+
+def test_acknowledge_and_resolve_endpoints():
+    """Verify acknowledge and resolve transitions with timestamps and notes."""
+    # Create an alert
+    res = client.post("/api/alerts", json={
+        "patient_id": "ack-patient",
+        "location": "Bathroom",
+        "severity": "CRITICAL",
+        "message": "Slip detected",
+    })
+    assert res.status_code == 201
+    alert_id = res.json()["id"]
+
+    # Acknowledge
+    ack_res = client.post(f"/api/alerts/{alert_id}/acknowledge", json={"notes": "Nurse checked room"})
+    assert ack_res.status_code == 200
+    ack_data = ack_res.json()
+    assert ack_data["status"] == "ACKNOWLEDGED"
+    assert ack_data["acknowledged_at"] is not None
+    assert ack_data["notes"] == "Nurse checked room"
+
+    # Resolve
+    res_resolve = client.post(f"/api/alerts/{alert_id}/resolve", json={"notes": "Patient safe, vitals normal"})
+    assert res_resolve.status_code == 200
+    res_data = res_resolve.json()
+    assert res_data["status"] == "RESOLVED"
+    assert res_data["resolved_at"] is not None
+    assert "Patient safe" in res_data["notes"]
+
+    # Clean up
+    client.delete(f"/api/alerts/{alert_id}")
+
+
+def test_analytics_summary_endpoint():
+    """Verify analytics summary endpoint aggregates counts and returns 7-day trend."""
+    res = client.get("/api/alerts/analytics/summary")
+    assert res.status_code == 200
+    data = res.json()
+    assert "total_incidents" in data
+    assert "active_incidents" in data
+    assert "acknowledged_incidents" in data
+    assert "resolved_incidents" in data
+    assert "daily_trend" in data
+    assert len(data["daily_trend"]) == 7
+    for point in data["daily_trend"]:
+        assert "date" in point
+        assert "label" in point
+        assert "count" in point
+
+
+def test_alerts_csv_export():
+    """Verify CSV export returns valid CSV content with expected headers."""
+    res = client.get("/api/alerts/export/csv")
+    assert res.status_code == 200
+    assert "text/csv" in res.headers["content-type"]
+    assert "Content-Disposition" in res.headers
+    text = res.text
+    assert "Incident ID,Patient ID,Location,Severity" in text
+
+
+def test_enhanced_health_endpoint():
+    """Verify health endpoint includes database connectivity and notification status."""
+    res = client.get("/api/health")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "healthy"
+    assert data["version"] == "0.2.0"
+    assert "database" in data
+    assert data["database"]["connected"] is True
+    assert "notifications" in data
+    assert data["notifications"]["mode"] in ("demo", "smtp")
+
+
+def test_temporal_fall_confirmation_and_tracking(monkeypatch, tmp_path):
+    """
+    Verify fall tracker state progression through /api/predict:
+    Frame 1 positive -> CONFIRMING state
+    Frame 2 positive within 2.5s -> FALL_ACTIVE, fall_confirmed=True, creates active incident in DB.
+    """
+    from app.routes import predict
+    import joblib
+
+    mock_model_dir = tmp_path / "model"
+    mock_model_dir.mkdir()
+    model_file = mock_model_dir / "random_forest_model.joblib"
+    monkeypatch.setattr(predict, "MODEL_DIR", mock_model_dir)
+
+    # Reset tracker before testing
+    client.post("/api/predict/tracker/reset")
+
+    # Set up dummy fall model (1 = Fall, confidence = 0.95)
+    joblib.dump(DummyCustomReturnModel(1, classes=[0, 1], probas=[[0.05, 0.95]]), model_file)
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
+    payload = {
+        "timestamp": "2026-10-15T12:00:00Z",
+        "landmarks": make_landmarks(33),
+        "patient_id": "temp-test-patient",
+    }
+
+    # Frame 1: first detection -> tracker enters CONFIRMING
+    res1 = client.post("/api/predict", json=payload)
+    assert res1.status_code == 200
+    d1 = res1.json()
+    assert d1["fall_detected"] is True
+    assert d1["tracker_state"] == "CONFIRMING"
+    assert d1["fall_confirmed"] is False
+
+    # Frame 2: second positive detection in close proximity -> FALL_ACTIVE
+    res2 = client.post("/api/predict", json=payload)
+    assert res2.status_code == 200
+    d2 = res2.json()
+    assert d2["fall_detected"] is True
+    assert d2["fall_confirmed"] is True
+    assert d2["tracker_state"] == "FALL_ACTIVE"
+    assert d2["active_incident_id"] is not None
+
+    # Clean up created incident and reset tracker
+    incident_id = d2["active_incident_id"]
+    client.delete(f"/api/alerts/{incident_id}")
+    client.post("/api/predict/tracker/reset")
+
+
+def test_is_demo_origin_tracking_and_csv():
+    """Verify demo seed incidents vs live incidents are explicitly distinguished in API and CSV."""
+    # 1. Check seeded demo incidents
+    res = client.get("/api/alerts")
+    assert res.status_code == 200
+    alerts = res.json()
+    demo_alerts = [a for a in alerts if a["id"] in ("inc-001", "inc-002", "inc-003")]
+    for a in demo_alerts:
+        assert a.get("is_demo") is True
+
+    # 2. Create a live telemetry incident
+    res_live = client.post("/api/alerts", json={
+        "patient_id": "live-pat-1",
+        "location": "Corridor",
+        "severity": "HIGH",
+        "message": "Real-time fall detected by pose telemetry",
+    })
+    assert res_live.status_code == 201
+    live_alert = res_live.json()
+    assert live_alert["is_demo"] is False
+
+    # 3. Check CSV export includes Origin column
+    csv_res = client.get("/api/alerts/export/csv")
+    assert csv_res.status_code == 200
+    text = csv_res.text
+    assert "Origin (Live/Demo)" in text
+    assert "Demo Seed" in text
+    assert "Live Telemetry" in text
+
+    # Cleanup live alert
+    client.delete(f"/api/alerts/{live_alert['id']}")
+
+
+def test_notification_duplicate_dispatch_suppression():
+    """Verify NotificationService guards against duplicate alert and escalation dispatches."""
+    import uuid
+    from app.notifications import notification_service
+
+    unique_id = f"test-dup-{uuid.uuid4().hex[:8]}"
+    test_incident = {
+        "id": unique_id,
+        "patient_id": "patient-dup",
+        "location": "Living Room",
+        "severity": "HIGH",
+        "confidence": 0.95,
+        "message": "Test duplicate suppression",
+    }
+
+    # First dispatch -> logs notification
+    res1 = notification_service.send_fall_alert(test_incident)
+    assert res1["success"] is True
+    assert res1["status"] in ("DEMO_LOGGED", "DELIVERED")
+
+    # Second dispatch for same incident -> suppressed duplicate
+    res2 = notification_service.send_fall_alert(test_incident)
+    assert res2["success"] is True
+    assert res2.get("already_dispatched") is True
+    assert res2["status"] == "ALREADY_DISPATCHED"
+
+    # Escalation duplicate protection
+    esc1 = notification_service.send_escalation_alert(test_incident)
+    assert esc1["success"] is True
+    assert esc1["status"] == "ESCALATED"
+
+    esc2 = notification_service.send_escalation_alert(test_incident)
+    assert esc2["success"] is True
+    assert esc2.get("already_dispatched") is True
+    assert esc2["status"] == "ALREADY_ESCALATED"
+
+
+def test_tracker_cooldown_rearm_and_separate_falls(monkeypatch, tmp_path):
+    """
+    Verify complete lifecycle across separate falls:
+    Fall 1 -> Recovery -> Cooldown -> Re-arm -> Fall 2 (creates separate incident).
+    """
+    from app.routes import predict
+    from app.fall_tracker import fall_tracker
+    import joblib
+
+    mock_model_dir = tmp_path / "model"
+    mock_model_dir.mkdir()
+    model_file = mock_model_dir / "random_forest_model.joblib"
+    monkeypatch.setattr(predict, "MODEL_DIR", mock_model_dir)
+
+    client.post("/api/predict/tracker/reset")
+
+    # Set up dummy model returning 1 (Fall)
+    joblib.dump(DummyCustomReturnModel(1, classes=[0, 1], probas=[[0.05, 0.95]]), model_file)
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
+    payload = {
+        "timestamp": "2026-10-15T12:00:00Z",
+        "landmarks": make_landmarks(33),
+        "patient_id": "multi-fall-test",
+    }
+
+    # 1. Fall 1: Confirming -> Active
+    client.post("/api/predict", json=payload)  # Frame 1: Confirming
+    res_fall1 = client.post("/api/predict", json=payload)  # Frame 2: Confirmed Fall 1
+    d_fall1 = res_fall1.json()
+    assert d_fall1["fall_confirmed"] is True
+    incident_id_1 = d_fall1["active_incident_id"]
+    assert incident_id_1 is not None
+
+    # 2. Resident recovers: Switch dummy model to normal posture (0 = Normal)
+    joblib.dump(DummyCustomReturnModel(0, classes=[0, 1], probas=[[0.95, 0.05]]), model_file)
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
+    # Send 4 normal frames to transition from FALL_ACTIVE to COOLDOWN
+    for _ in range(4):
+        client.post("/api/predict", json=payload)
+
+    # Cooldown should now be active
+    state_after_rec = fall_tracker._get_patient_state("multi-fall-test")
+    assert state_after_rec["tracker_state"] == "COOLDOWN"
+
+    # 3. Reset or re-arm tracker
+    client.post("/api/predict/tracker/reset?patient_id=multi-fall-test")
+    assert fall_tracker._get_patient_state("multi-fall-test")["tracker_state"] == "MONITORING"
+
+    # 4. Fall 2: Switch dummy model back to Fall
+    joblib.dump(DummyCustomReturnModel(1, classes=[0, 1], probas=[[0.05, 0.95]]), model_file)
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
+    client.post("/api/predict", json=payload)  # Frame 1
+    res_fall2 = client.post("/api/predict", json=payload)  # Frame 2
+    d_fall2 = res_fall2.json()
+    assert d_fall2["fall_confirmed"] is True
+    incident_id_2 = d_fall2["active_incident_id"]
+
+    # Verify that Fall 1 and Fall 2 are two distinct incidents in SQLite!
+    assert incident_id_1 != incident_id_2
+    assert client.get(f"/api/alerts/{incident_id_1}").status_code == 200
+    assert client.get(f"/api/alerts/{incident_id_2}").status_code == 200
+
+    # Clean up
+    client.delete(f"/api/alerts/{incident_id_1}")
+    client.delete(f"/api/alerts/{incident_id_2}")
+    client.post("/api/predict/tracker/reset?patient_id=multi-fall-test")
+
+
+def test_missing_or_invalid_landmarks_handling():
+    """Verify predictive endpoint gracefully rejects invalid or non-33 landmark inputs."""
+    # 1. Missing landmarks array
+    res_empty = client.post("/api/predict", json={"landmarks": []})
+    assert res_empty.status_code == 422
+
+    # 2. Fewer than 33 landmarks
+    res_short = client.post("/api/predict", json={"landmarks": make_landmarks(15)})
+    assert res_short.status_code == 422
+    assert "33" in res_short.text
+
+    # 3. Greater than 33 landmarks
+    res_long = client.post("/api/predict", json={"landmarks": make_landmarks(34)})
+    assert res_long.status_code == 422

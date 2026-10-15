@@ -4,8 +4,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 from fastapi import APIRouter
+from app.fall_tracker import fall_tracker
 from app.features import FEATURE_NAMES, extract_feature_vector, extract_features
-from app.schemas import PosePredictionRequest, PredictionResponse
+from app.schemas import (
+    PosePredictionRequest,
+    PredictionResponse,
+    TrackerConfigResponse,
+)
 
 router = APIRouter(tags=["Prediction"])
 
@@ -323,13 +328,40 @@ async def predict_fall(request: PosePredictionRequest) -> PredictionResponse:
                 confidence = None
                 fall_probability = None
 
+        # Execute temporal confirmation, duplicate suppression, and near-fall tracking
+        landmarks_data = [
+            lm.model_dump() if hasattr(lm, "model_dump") else (lm if isinstance(lm, dict) else dict(lm))
+            for lm in request.landmarks
+        ]
+        tracker_res = fall_tracker.process_frame(
+            landmarks=landmarks_data,
+            features=features,
+            fall_detected=fall_detected,
+            confidence=confidence,
+            fall_probability=fall_probability,
+            patient_id=request.patient_id or "patient-001",
+        )
+
         return PredictionResponse(
             model_loaded=True,
             fall_detected=fall_detected,
             confidence=confidence,
             fall_probability=fall_probability,
             features_extracted=len(features),
-            message="Fall detection inference completed successfully.",
+            fall_confirmed=tracker_res["fall_confirmed"],
+            active_incident_id=tracker_res["active_incident_id"],
+            tracker_state=tracker_res["tracker_state"],
+            near_fall=tracker_res["near_fall"],
+            post_fall_immobility=tracker_res["post_fall_immobility"],
+            message=(
+                "Emergency fall event confirmed and alert active."
+                if tracker_res["fall_confirmed"]
+                else (
+                    "Postural instability warning (near-fall tilt observed)."
+                    if tracker_res["near_fall"]
+                    else "Fall detection inference completed successfully."
+                )
+            ),
             status="ok",
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
@@ -355,6 +387,33 @@ async def predict_fall(request: PosePredictionRequest) -> PredictionResponse:
             status="model_not_ready",
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
+
+
+@router.get(
+    "/predict/tracker-config",
+    response_model=TrackerConfigResponse,
+    summary="Get temporal fall confirmation & escalation thresholds",
+)
+async def get_tracker_config() -> TrackerConfigResponse:
+    """Returns current temporal confirmation parameters and escalation timing."""
+    return TrackerConfigResponse(
+        confirmation_frames_needed=fall_tracker.confirmation_frames_needed,
+        confirmation_window_s=fall_tracker.confirmation_window_s,
+        cooldown_period_s=fall_tracker.cooldown_period_s,
+        min_fall_probability=fall_tracker.min_fall_probability,
+        immobility_seconds_threshold=fall_tracker.immobility_seconds_threshold,
+        escalation_delay_seconds=fall_tracker.escalation_delay_seconds,
+    )
+
+
+@router.post(
+    "/predict/tracker/reset",
+    summary="Reset temporal tracker state for a patient",
+)
+async def reset_tracker(patient_id: str = "patient-001") -> dict:
+    """Resets temporal confirmation and active fall state back to MONITORING."""
+    fall_tracker.reset_patient(patient_id)
+    return {"message": f"Fall tracker reset to MONITORING for patient '{patient_id}'."}
 
 
 @router.get(

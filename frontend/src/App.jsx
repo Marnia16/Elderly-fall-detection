@@ -1,8 +1,10 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import Header from './components/Header';
 import MetricCard from './components/MetricCard';
 import CameraPanel from './components/CameraPanel';
 import FallStatusCard from './components/FallStatusCard';
+import ActiveAlertBanner from './components/ActiveAlertBanner';
+import AnalyticsPanel from './components/AnalyticsPanel';
 import IncidentLog from './components/IncidentLog';
 import AlertHistory from './components/AlertHistory';
 import SystemInfo from './components/SystemInfo';
@@ -15,17 +17,49 @@ import {
 } from 'lucide-react';
 import {
   MOCK_DISCLAIMER_TEXT,
-  MOCK_SYSTEM_METRICS,
   MOCK_ROOM_INFO,
 } from './mock/mockData';
+import { fetchAlerts, fetchAlertAnalytics } from './config/api';
 
 export default function App() {
   const [livePrediction, setLivePrediction] = useState(null);
   const [apiError, setApiError] = useState(null);
   const [cameraActive, setCameraActive] = useState(false);
+  const [activeAlerts, setActiveAlerts] = useState([]);
+  const [analyticsData, setAnalyticsData] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const refreshAlertsAndAnalytics = useCallback(() => {
+    fetchAlerts({ status: 'ACTIVE', limit: 10 })
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setActiveAlerts(data);
+        }
+      })
+      .catch(() => {});
+
+    fetchAlertAnalytics()
+      .then((data) => {
+        if (data && typeof data.total_incidents === 'number') {
+          setAnalyticsData(data);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Poll alerts and analytics periodically (every 5s)
+  useEffect(() => {
+    refreshAlertsAndAnalytics();
+    const interval = setInterval(refreshAlertsAndAnalytics, 5000);
+    return () => clearInterval(interval);
+  }, [refreshAlertsAndAnalytics, refreshKey]);
 
   const handlePredictionUpdate = useCallback((prediction) => {
     setLivePrediction(prediction);
+    // If a fall was confirmed or incident created, trigger immediate refresh
+    if (prediction && prediction.fall_confirmed) {
+      setRefreshKey((prev) => prev + 1);
+    }
   }, []);
 
   const handlePredictionError = useCallback((error) => {
@@ -36,10 +70,27 @@ export default function App() {
     setCameraActive(status === 'ACTIVE');
   }, []);
 
+  const handleAlertStateChanged = useCallback(() => {
+    setRefreshKey((prev) => prev + 1);
+    refreshAlertsAndAnalytics();
+  }, [refreshAlertsAndAnalytics]);
+
+  const isConfirmedFall = Boolean(livePrediction?.fall_confirmed || livePrediction?.fall_detected);
+
   return (
     <div className="app-container">
       {/* Top Navigation & Live Telemetry Header */}
-      <Header />
+      <Header
+        cameraActive={cameraActive}
+        isLiveStreaming={Boolean(cameraActive && livePrediction)}
+      />
+
+      {/* Active Persistent Incident Emergency Banner (audible siren + acknowledge/resolve) */}
+      <ActiveAlertBanner
+        activeAlerts={activeAlerts}
+        livePrediction={livePrediction}
+        onAlertUpdated={handleAlertStateChanged}
+      />
 
       {/* Prominent Demonstration & Simulation Disclaimer */}
       <div className="disclaimer-banner" role="status">
@@ -74,8 +125,10 @@ export default function App() {
             title="Current Fall State"
             value={
               cameraActive && livePrediction
-                ? livePrediction.fall_detected
-                  ? 'FALL DETECTED'
+                ? isConfirmedFall
+                  ? 'FALL CONFIRMED'
+                  : livePrediction.near_fall
+                  ? 'NEAR-FALL TILT'
                   : 'Safe / Upright'
                 : cameraActive
                 ? 'Tracking Pose...'
@@ -83,7 +136,7 @@ export default function App() {
             }
             subtitle={
               cameraActive && livePrediction
-                ? livePrediction.fall_detected
+                ? isConfirmedFall
                   ? `Fall prob: ${Math.round((livePrediction.fall_probability ?? 0) * 100)}%`
                   : `Posture conf: ${Math.round((livePrediction.confidence ?? 0) * 100)}%`
                 : cameraActive
@@ -93,8 +146,10 @@ export default function App() {
             icon={Activity}
             badge={
               cameraActive && livePrediction
-                ? livePrediction.fall_detected
+                ? isConfirmedFall
                   ? 'CRITICAL ALERT'
+                  : livePrediction.near_fall
+                  ? 'Near-Fall Tilt'
                   : 'Live ML Safe'
                 : 'Model Ready'
             }
@@ -133,13 +188,24 @@ export default function App() {
               isLiveActive={cameraActive}
               apiError={apiError}
             />
-            <IncidentLog />
+            <IncidentLog refreshTrigger={refreshKey} />
           </div>
         </section>
 
-        {/* Historical Alert Audit Table */}
+        {/* Incident Analytics & 7-Day Trend Chart */}
         <section style={{ marginTop: '1.5rem' }}>
-          <AlertHistory />
+          <AnalyticsPanel
+            analyticsData={analyticsData}
+            onRefresh={handleAlertStateChanged}
+          />
+        </section>
+
+        {/* Historical Alert Audit Table with CSV Download & Print */}
+        <section style={{ marginTop: '1.5rem' }}>
+          <AlertHistory
+            refreshTrigger={refreshKey}
+            onIncidentChanged={handleAlertStateChanged}
+          />
         </section>
 
         {/* Academic Architecture & Specifications */}
@@ -149,10 +215,10 @@ export default function App() {
       {/* Footer */}
       <footer className="app-footer" role="contentinfo">
         <div>
-          <strong>Elderly Fall Detection &amp; Alert System</strong> &bull; Academic Project (MacBook Air M4 + Windows Team)
+          <strong>Elderly Fall Detection &amp; Alert System</strong> &bull; Full-Stack AI Telemetry Platform
         </div>
         <div>
-          React 18 &bull; Vite 5 &bull; Prepared for MediaPipe Pose &amp; FastAPI Backend
+          React 18 &bull; Vite 5 &bull; MediaPipe Pose &bull; FastAPI &bull; SQLite &bull; Random Forest
         </div>
       </footer>
     </div>

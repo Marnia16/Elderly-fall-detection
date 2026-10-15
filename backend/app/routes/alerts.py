@@ -1,40 +1,30 @@
-"""In-memory incident and alert management endpoints."""
+"""Persistent SQLite incident and alert management endpoints."""
 
-import uuid
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
-from fastapi import APIRouter, HTTPException, Query, status
-from app.schemas import AlertCreate, AlertResponse, AlertStatus, AlertUpdate
+from typing import List, Optional
+from fastapi import APIRouter, HTTPException, Query, Response, status
+from pydantic import BaseModel, Field
+
+from app import database
+from app.notifications import notification_service
+from app.schemas import (
+    AlertAnalyticsResponse,
+    AlertCreate,
+    AlertResponse,
+    AlertSeverity,
+    AlertStatus,
+    AlertUpdate,
+)
 
 router = APIRouter(tags=["Alerts"])
 
-# In-memory storage for incidents/alerts
-_alerts_db: Dict[str, dict] = {}
 
-
-def _seed_initial_alert() -> None:
-    """Pre-populate a sample incident for frontend dashboard demonstration."""
-    sample_id = "inc-001"
-    _alerts_db[sample_id] = {
-        "id": sample_id,
-        "patient_id": "patient-101",
-        "location": "Living Room",
-        "severity": "HIGH",
-        "message": "Rapid vertical deceleration detected — possible fall near couch.",
-        "status": "ACTIVE",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "sensor_snapshot": {
-            "accel_x": 0.35,
-            "accel_y": -1.82,
-            "accel_z": 18.45,
-            "gyro_magnitude": 142.3,
-        },
-        "notes": "Automated alert logged by telemetry stream.",
-    }
-
-
-# Seed the storage on startup
-_seed_initial_alert()
+class CaregiverActionPayload(BaseModel):
+    notes: Optional[str] = Field(
+        default=None,
+        description="Optional caregiver notes or resolution comment",
+        examples=["Assisted resident to chair. No injuries reported."],
+    )
 
 
 @router.get(
@@ -48,17 +38,82 @@ async def list_alerts(
         alias="status",
         description="Filter alerts by status (ACTIVE, ACKNOWLEDGED, RESOLVED)",
     ),
-    limit: int = Query(50, ge=1, le=100, description="Max number of items to return"),
+    severity_filter: Optional[AlertSeverity] = Query(
+        None,
+        alias="severity",
+        description="Filter alerts by severity (LOW, MEDIUM, HIGH, CRITICAL)",
+    ),
+    start_date: Optional[str] = Query(
+        None,
+        description="Filter created_at after ISO date string",
+    ),
+    end_date: Optional[str] = Query(
+        None,
+        description="Filter created_at before ISO date string",
+    ),
+    search: Optional[str] = Query(
+        None,
+        description="Search query across message, location, notes, and patient_id",
+    ),
+    limit: int = Query(50, ge=1, le=200, description="Max number of items to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
 ) -> List[AlertResponse]:
-    """Retrieve all alerts stored in memory, ordered with the newest first."""
-    alerts = list(_alerts_db.values())
+    """Retrieve persistent incident records from SQLite, ordered with newest first."""
+    incidents, _ = database.list_incidents(
+        status_filter=status_filter.value if status_filter else None,
+        severity_filter=severity_filter.value if severity_filter else None,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+    return [AlertResponse(**inc) for inc in incidents]
 
-    if status_filter:
-        alerts = [a for a in alerts if a.get("status") == status_filter.value]
 
-    # Sort descending by timestamp
-    alerts.sort(key=lambda a: a.get("timestamp", ""), reverse=True)
-    return [AlertResponse(**a) for a in alerts[:limit]]
+@router.get(
+    "/alerts/analytics/summary",
+    response_model=AlertAnalyticsResponse,
+    summary="Get incident analytics summary and 7-day trend",
+)
+async def get_analytics_summary() -> AlertAnalyticsResponse:
+    """Computes real incident metrics and daily frequency trend from persistent SQLite data."""
+    summary = database.get_analytics_summary()
+    return AlertAnalyticsResponse(**summary)
+
+
+@router.get(
+    "/alerts/export/csv",
+    summary="Export incidents as CSV report",
+)
+async def export_alerts_csv(
+    status_filter: Optional[AlertStatus] = Query(
+        None,
+        alias="status",
+        description="Filter exported incidents by status",
+    ),
+    start_date: Optional[str] = Query(
+        None,
+        description="Filter start ISO date",
+    ),
+    end_date: Optional[str] = Query(
+        None,
+        description="Filter end ISO date",
+    ),
+) -> Response:
+    """Generates downloadable CSV containing incident history for caregiver reporting."""
+    csv_content = database.export_incidents_to_csv(
+        status_filter=status_filter.value if status_filter else None,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"elderly_fall_incidents_{now_str}.csv"
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post(
@@ -68,21 +123,23 @@ async def list_alerts(
     summary="Create a new fall incident alert",
 )
 async def create_alert(payload: AlertCreate) -> AlertResponse:
-    """Create a new fall incident alert and store it in memory."""
-    alert_id = f"inc-{uuid.uuid4().hex[:8]}"
-    alert_record = {
-        "id": alert_id,
-        "patient_id": payload.patient_id or "patient-001",
-        "location": payload.location or "Unknown",
-        "severity": payload.severity.value,
-        "message": payload.message,
-        "status": AlertStatus.ACTIVE.value,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "sensor_snapshot": payload.sensor_snapshot,
-        "notes": None,
-    }
-    _alerts_db[alert_id] = alert_record
-    return AlertResponse(**alert_record)
+    """Create a new fall incident alert and persist it in SQLite."""
+    record_dict = payload.model_dump()
+    # Normalize enum to string for database layer
+    if isinstance(record_dict.get("severity"), AlertSeverity):
+        record_dict["severity"] = record_dict["severity"].value
+    if isinstance(record_dict.get("status"), AlertStatus):
+        record_dict["status"] = record_dict["status"].value
+
+    created = database.create_incident(record_dict)
+
+    # Dispatch notification for high/critical active alerts
+    try:
+        notification_service.send_fall_alert(created)
+    except Exception:
+        pass
+
+    return AlertResponse(**created)
 
 
 @router.get(
@@ -91,13 +148,14 @@ async def create_alert(payload: AlertCreate) -> AlertResponse:
     summary="Get incident details by ID",
 )
 async def get_alert(alert_id: str) -> AlertResponse:
-    """Retrieve details for a specific incident alert."""
-    if alert_id not in _alerts_db:
+    """Retrieve details for a specific incident alert from SQLite."""
+    incident = database.get_incident(alert_id)
+    if not incident:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident alert with ID '{alert_id}' not found.",
         )
-    return AlertResponse(**_alerts_db[alert_id])
+    return AlertResponse(**incident)
 
 
 @router.patch(
@@ -106,20 +164,86 @@ async def get_alert(alert_id: str) -> AlertResponse:
     summary="Update incident alert status or notes",
 )
 async def update_alert(alert_id: str, payload: AlertUpdate) -> AlertResponse:
-    """Update status (e.g. ACKNOWLEDGED or RESOLVED) or caregiver notes."""
-    if alert_id not in _alerts_db:
+    """Update status (e.g. ACKNOWLEDGED or RESOLVED), notes, or escalation flag."""
+    existing = database.get_incident(alert_id)
+    if not existing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident alert with ID '{alert_id}' not found.",
         )
 
-    alert = _alerts_db[alert_id]
-    if payload.status is not None:
-        alert["status"] = payload.status.value
-    if payload.notes is not None:
-        alert["notes"] = payload.notes
+    updated = database.update_incident(
+        incident_id=alert_id,
+        status=payload.status.value if payload.status else None,
+        notes=payload.notes,
+        escalated=payload.escalated,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident alert with ID '{alert_id}' not found.",
+        )
+    return AlertResponse(**updated)
 
-    return AlertResponse(**alert)
+
+@router.post(
+    "/alerts/{alert_id}/acknowledge",
+    response_model=AlertResponse,
+    summary="Acknowledge an active incident",
+)
+async def acknowledge_alert(
+    alert_id: str,
+    payload: Optional[CaregiverActionPayload] = None,
+) -> AlertResponse:
+    """Mark an incident as acknowledged by a caregiver, recording timestamp and optional notes."""
+    existing = database.get_incident(alert_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident alert with ID '{alert_id}' not found.",
+        )
+
+    notes = payload.notes if payload and payload.notes else existing.get("notes")
+    updated = database.update_incident(
+        incident_id=alert_id,
+        status="ACKNOWLEDGED",
+        notes=notes,
+        acknowledged_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return AlertResponse(**updated)
+
+
+@router.post(
+    "/alerts/{alert_id}/resolve",
+    response_model=AlertResponse,
+    summary="Resolve an incident",
+)
+async def resolve_alert(
+    alert_id: str,
+    payload: Optional[CaregiverActionPayload] = None,
+) -> AlertResponse:
+    """Mark an incident as resolved, recording resolution timestamp and caregiver notes."""
+    existing = database.get_incident(alert_id)
+    if not existing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident alert with ID '{alert_id}' not found.",
+        )
+
+    combined_notes = existing.get("notes") or ""
+    if payload and payload.notes:
+        if combined_notes:
+            combined_notes += f" | Resolution: {payload.notes}"
+        else:
+            combined_notes = payload.notes
+
+    updated = database.update_incident(
+        incident_id=alert_id,
+        status="RESOLVED",
+        notes=combined_notes or None,
+        resolved_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return AlertResponse(**updated)
 
 
 @router.delete(
@@ -128,13 +252,13 @@ async def update_alert(alert_id: str, payload: AlertUpdate) -> AlertResponse:
     summary="Dismiss or delete an incident alert",
 )
 async def delete_alert(alert_id: str):
-    """Delete an alert from memory."""
-    if alert_id not in _alerts_db:
+    """Delete an incident permanently from the SQLite database."""
+    success = database.delete_incident(alert_id)
+    if not success:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Incident alert with ID '{alert_id}' not found.",
         )
-    del _alerts_db[alert_id]
     return None
 
 
@@ -144,7 +268,6 @@ async def delete_alert(alert_id: str):
     summary="Clear all alerts (for testing/reset)",
 )
 async def clear_all_alerts() -> dict:
-    """Clear all in-memory alerts."""
-    count = len(_alerts_db)
-    _alerts_db.clear()
-    return {"message": f"Cleared {count} alerts from memory."}
+    """Clear all alerts from SQLite database."""
+    count = database.clear_all_incidents()
+    return {"message": f"Cleared {count} alerts from database."}
