@@ -104,8 +104,13 @@ class PredictionResponse(BaseModel):
     )
     confidence: Optional[float] = Field(
         default=None,
-        description="Confidence score between 0.0 and 1.0 (None when model is not yet loaded)",
-        examples=[None],
+        description="Winning-class confidence score between 0.0 and 1.0 (max probability across classes, None when model is not yet loaded)",
+        examples=[0.96],
+    )
+    fall_probability: Optional[float] = Field(
+        default=None,
+        description="Estimated probability of fall between 0.0 and 1.0 (None when predict_proba is unavailable, class mapping is ambiguous, or model is not loaded)",
+        examples=[0.96],
     )
     features_extracted: Optional[int] = Field(
         default=None,

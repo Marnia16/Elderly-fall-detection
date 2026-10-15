@@ -49,6 +49,11 @@ These features capture body posture, orientation, and bounding geometry independ
 12 key body joints normalized by centering at Mid-Hip $(H_x, H_y, H_z)$ and scaling by `torso_length`:
 $\tilde{x} = \frac{x - H_x}{L_{torso}}$, $\tilde{y} = \frac{y - H_y}{L_{torso}}$, $\tilde{z} = \frac{z - H_z}{L_{torso}}$
 
+Where:
+- Mid-Hip: $H_x = \frac{\text{left\_hip}_x + \text{right\_hip}_x}{2}$, $H_y = \frac{\text{left\_hip}_y + \text{right\_hip}_y}{2}$, $H_z = \frac{\text{left\_hip}_z + \text{right\_hip}_z}{2}$
+- Mid-Shoulder: $S_x = \frac{\text{left\_shoulder}_x + \text{right\_shoulder}_x}{2}$, $S_y = \frac{\text{left\_shoulder}_y + \text{right\_shoulder}_y}{2}$, $S_z = \frac{\text{left\_shoulder}_z + \text{right\_shoulder}_z}{2}$
+- Torso Length: $L_{torso} = \sqrt{(H_x - S_x)^2 + (H_y - S_y)^2 + (H_z - S_z)^2}$ (with a minimum floor $\epsilon = 1e-4$)
+
 12. `rel_nose_x`
 13. `rel_nose_y`
 14. `rel_nose_z`

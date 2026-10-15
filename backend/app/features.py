@@ -173,7 +173,7 @@ def extract_features(landmarks: Sequence[Any]) -> Dict[str, float]:
 
     mid_hip_x = (lh_x + rh_x) / 2.0
     mid_hip_y = (lh_y + rh_y) / 2.0
-    mid_hip_z = (lh_y + rh_y) / 2.0
+    mid_hip_z = (lh_z + rh_z) / 2.0
 
     mid_knee_y = (lk_y + rk_y) / 2.0
     mid_ankle_y = (la_y + ra_y) / 2.0
