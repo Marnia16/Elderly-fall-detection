@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useCallback } from 'react';
 import Header from './components/Header';
 import MetricCard from './components/MetricCard';
 import CameraPanel from './components/CameraPanel';
@@ -20,6 +20,22 @@ import {
 } from './mock/mockData';
 
 export default function App() {
+  const [livePrediction, setLivePrediction] = useState(null);
+  const [apiError, setApiError] = useState(null);
+  const [cameraActive, setCameraActive] = useState(false);
+
+  const handlePredictionUpdate = useCallback((prediction) => {
+    setLivePrediction(prediction);
+  }, []);
+
+  const handlePredictionError = useCallback((error) => {
+    setApiError(error);
+  }, []);
+
+  const handleCameraStatusChange = useCallback((status) => {
+    setCameraActive(status === 'ACTIVE');
+  }, []);
+
   return (
     <div className="app-container">
       {/* Top Navigation & Live Telemetry Header */}
@@ -29,10 +45,16 @@ export default function App() {
       <div className="disclaimer-banner" role="status">
         <div className="disclaimer-content">
           <AlertTriangle size={16} aria-hidden="true" />
-          <span>{MOCK_DISCLAIMER_TEXT}</span>
+          <span>
+            {cameraActive && livePrediction
+              ? 'Live Inference Active: Streaming 33 MediaPipe pose landmarks to FastAPI Random Forest model.'
+              : MOCK_DISCLAIMER_TEXT}
+          </span>
         </div>
         <span style={{ fontSize: '0.72rem', opacity: 0.85 }}>
-          [Demonstration Foundation Mode]
+          {cameraActive && livePrediction
+            ? '[Live Prediction Mode]'
+            : '[Demonstration Foundation Mode]'}
         </span>
       </div>
 
@@ -42,18 +64,40 @@ export default function App() {
         <section className="metrics-grid" aria-label="System Metrics Overview">
           <MetricCard
             title="Camera Input"
-            value={MOCK_SYSTEM_METRICS.camera.status}
-            subtitle={MOCK_SYSTEM_METRICS.camera.resolution}
+            value={cameraActive ? 'Active Stream' : 'Camera Off'}
+            subtitle={cameraActive ? 'Live Webcam (Front-Facing)' : 'Click Start Camera below'}
             icon={Camera}
-            badge="Webcam Ready"
+            badge={cameraActive ? 'Live' : 'Standby'}
           />
 
           <MetricCard
             title="Current Fall State"
-            value="Safe / Upright"
-            subtitle="Posture confidence: 98.4%"
+            value={
+              cameraActive && livePrediction
+                ? livePrediction.fall_detected
+                  ? 'FALL DETECTED'
+                  : 'Safe / Upright'
+                : cameraActive
+                ? 'Tracking Pose...'
+                : 'Safe / Upright'
+            }
+            subtitle={
+              cameraActive && livePrediction
+                ? livePrediction.fall_detected
+                  ? `Fall prob: ${Math.round((livePrediction.fall_probability ?? 0) * 100)}%`
+                  : `Posture conf: ${Math.round((livePrediction.confidence ?? 0) * 100)}%`
+                : cameraActive
+                ? 'Streaming landmarks to FastAPI'
+                : 'FastAPI RF Model Ready'
+            }
             icon={Activity}
-            badge="Mock Telemetry"
+            badge={
+              cameraActive && livePrediction
+                ? livePrediction.fall_detected
+                  ? 'CRITICAL ALERT'
+                  : 'Live ML Safe'
+                : 'Model Ready'
+            }
           />
 
           <MetricCard
@@ -67,7 +111,7 @@ export default function App() {
           <MetricCard
             title="ML Pipeline"
             value="Random Forest"
-            subtitle="MediaPipe 33-Keypoint Ready"
+            subtitle="47 Server Features / MediaPipe"
             icon={Cpu}
             badge="FastAPI Interface"
           />
@@ -75,12 +119,20 @@ export default function App() {
 
         {/* Primary Monitoring Viewport & Telemetry Grid */}
         <section className="dashboard-grid">
-          {/* Left Column: Camera Viewport Placeholder */}
-          <CameraPanel />
+          {/* Left Column: Camera Viewport with MediaPipe & FastAPI Streaming */}
+          <CameraPanel
+            onPredictionUpdate={handlePredictionUpdate}
+            onPredictionError={handlePredictionError}
+            onCameraStatusChange={handleCameraStatusChange}
+          />
 
           {/* Right Column: Fall Status & Recent Activity */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-            <FallStatusCard />
+            <FallStatusCard
+              livePrediction={livePrediction}
+              isLiveActive={cameraActive}
+              apiError={apiError}
+            />
             <IncidentLog />
           </div>
         </section>

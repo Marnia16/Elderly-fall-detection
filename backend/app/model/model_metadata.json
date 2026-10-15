@@ -1,0 +1,82 @@
+{
+  "model_name": "RandomForestClassifier",
+  "n_estimators": 100,
+  "max_depth": 10,
+  "random_state": 42,
+  "n_features_in": 47,
+  "classes": [
+    0,
+    1
+  ],
+  "class_mapping": {
+    "0": "Normal/ADL",
+    "1": "Fall"
+  },
+  "training_dataset": "UR Fall Detection Dataset (fall-01 and adl-01 sequences)",
+  "samples": {
+    "total": 254,
+    "fall_count": 122,
+    "adl_count": 132,
+    "train_count": 203,
+    "test_count": 51
+  },
+  "evaluation_metrics": {
+    "test_accuracy": 0.9804,
+    "test_precision": 1.0,
+    "test_recall": 0.9583,
+    "test_f1_score": 0.9787,
+    "test_roc_auc": 0.9977,
+    "confusion_matrix": {
+      "true_negative": 27,
+      "false_positive": 0,
+      "false_negative": 1,
+      "true_positive": 23
+    },
+    "five_fold_cv_accuracy_mean": 0.9645,
+    "five_fold_cv_accuracy_std": 0.0231
+  },
+  "top_features": [
+    {
+      "feature": "rel_left_shoulder_y",
+      "importance": 0.0935
+    },
+    {
+      "feature": "knee_to_ankle_vertical_dist",
+      "importance": 0.0763
+    },
+    {
+      "feature": "rel_left_elbow_y",
+      "importance": 0.0665
+    },
+    {
+      "feature": "rel_right_ankle_y",
+      "importance": 0.0635
+    },
+    {
+      "feature": "rel_mid_shoulder_z",
+      "importance": 0.0583
+    },
+    {
+      "feature": "hip_to_ankle_vertical_dist",
+      "importance": 0.0516
+    },
+    {
+      "feature": "rel_right_ankle_z",
+      "importance": 0.036
+    },
+    {
+      "feature": "rel_left_ankle_y",
+      "importance": 0.0358
+    },
+    {
+      "feature": "rel_mid_shoulder_y",
+      "importance": 0.0345
+    },
+    {
+      "feature": "torso_length",
+      "importance": 0.0342
+    }
+  ],
+  "trained_at_utc": "2026-10-15T15:40:08.100875+00:00",
+  "trained_by": "Marnia & Keerthana"
+}

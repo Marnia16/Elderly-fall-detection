@@ -16,6 +16,7 @@ import {
   FilesetResolver,
   DrawingUtils,
 } from '@mediapipe/tasks-vision';
+import { sendPosePrediction } from '../config/api';
 
 // Explicit, plain asset URLs pinned to installed package version @1.1.0
 const MEDIAPIPE_WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm';
@@ -25,12 +26,15 @@ const POSE_LANDMARKER_MODEL_URL =
 /**
  * CameraPanel
  *
- * Manages live webcam capture, permission handling, and MediaPipe Pose Landmarker
- * real-time skeleton overlay on top of the live video stream.
- *
- * Note: Real fall classification is not integrated yet (Phase 2).
+ * Manages live webcam capture, permission handling, MediaPipe Pose Landmarker
+ * real-time skeleton overlay, and streaming 33 pose landmarks to the FastAPI
+ * backend Random Forest fall-detection model.
  */
-export default function CameraPanel() {
+export default function CameraPanel({
+  onPredictionUpdate,
+  onPredictionError,
+  onCameraStatusChange,
+}) {
   // State machine: 'OFF' | 'REQUESTING_PERMISSION' | 'ACTIVE' | 'PERMISSION_DENIED' | 'ERROR' | 'NOT_SUPPORTED'
   const [cameraState, setCameraState] = useState('OFF');
   const [errorMessage, setErrorMessage] = useState('');
@@ -41,6 +45,10 @@ export default function CameraPanel() {
   const [videoResolution, setVideoResolution] = useState({ width: 0, height: 0 });
   const [deviceLabel, setDeviceLabel] = useState('');
 
+  // Real-time backend prediction state
+  const [latestPrediction, setLatestPrediction] = useState(null);
+  const [predictionError, setPredictionError] = useState(null);
+
   // DOM and stream references
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -49,6 +57,24 @@ export default function CameraPanel() {
   const poseLandmarkerRef = useRef(null);
   const initPromiseRef = useRef(null);
   const isRunningRef = useRef(false);
+
+  // Stable callback refs to decouple camera lifecycle from parent re-renders
+  const onPredictionUpdateRef = useRef(onPredictionUpdate);
+  const onPredictionErrorRef = useRef(onPredictionError);
+  const onCameraStatusChangeRef = useRef(onCameraStatusChange);
+
+  useEffect(() => {
+    onPredictionUpdateRef.current = onPredictionUpdate;
+    onPredictionErrorRef.current = onPredictionError;
+    onCameraStatusChangeRef.current = onCameraStatusChange;
+  }, [onPredictionUpdate, onPredictionError, onCameraStatusChange]);
+
+  // Throttled prediction tracking
+  const lastPredictionTimeRef = useRef(0);
+  const isRequestInFlightRef = useRef(false);
+  const abortControllerRef = useRef(null);
+  const requestIdRef = useRef(0);
+  const frameCounterRef = useRef(0);
 
   // Performance tracking
   const lastVideoTimeRef = useRef(-1);
@@ -185,6 +211,49 @@ export default function CameraPanel() {
                 lineWidth: 1.5,
                 radius: 4,
               });
+
+              // Throttled prediction streaming to FastAPI backend (target ~650ms, within 500-1000ms range)
+              const nowMs = performance.now();
+              if (
+                landmarks.length === 33 &&
+                nowMs - lastPredictionTimeRef.current >= 650 &&
+                !isRequestInFlightRef.current
+              ) {
+                lastPredictionTimeRef.current = nowMs;
+                isRequestInFlightRef.current = true;
+                requestIdRef.current += 1;
+                const currentRequestId = requestIdRef.current;
+                frameCounterRef.current += 1;
+                const currentFrameId = frameCounterRef.current;
+
+                if (abortControllerRef.current) {
+                  abortControllerRef.current.abort();
+                }
+                const controller = new AbortController();
+                abortControllerRef.current = controller;
+
+                sendPosePrediction(landmarks, currentFrameId, 'patient-001', controller.signal)
+                  .then((data) => {
+                    if (isRunningRef.current && currentRequestId === requestIdRef.current) {
+                      setLatestPrediction(data);
+                      setPredictionError(null);
+                      onPredictionUpdateRef.current?.(data);
+                    }
+                  })
+                  .catch((err) => {
+                    if (err.name === 'AbortError') return;
+                    console.warn('[Prediction] API request error:', err.message);
+                    if (isRunningRef.current && currentRequestId === requestIdRef.current) {
+                      setPredictionError(err.message);
+                      onPredictionErrorRef.current?.(err.message);
+                    }
+                  })
+                  .finally(() => {
+                    if (currentRequestId === requestIdRef.current) {
+                      isRequestInFlightRef.current = false;
+                    }
+                  });
+              }
             } else {
               setDetectedLandmarksCount(0);
             }
@@ -211,9 +280,10 @@ export default function CameraPanel() {
   }, []);
 
   /**
-   * Stops all active camera tracks and tears down loop
+   * Releases hardware streams, pauses video, cancels render loop, and aborts in-flight network requests.
+   * Does NOT overwrite UI state machines so errors remain displayed when stream acquisition fails.
    */
-  const stopCamera = useCallback(() => {
+  const releaseCameraResources = useCallback(() => {
     isRunningRef.current = false;
 
     if (animFrameIdRef.current) {
@@ -221,15 +291,24 @@ export default function CameraPanel() {
       animFrameIdRef.current = null;
     }
 
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    isRequestInFlightRef.current = false;
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => {
         track.stop();
-        console.log(`[Webcam] Stopped track: "${track.label}"`);
+        console.log(`[Webcam] Stopped camera track: "${track.label}"`);
       });
       streamRef.current = null;
     }
 
     if (videoRef.current) {
+      videoRef.current.onloadedmetadata = null;
+      videoRef.current.oncanplay = null;
+      videoRef.current.onplaying = null;
       videoRef.current.pause();
       videoRef.current.srcObject = null;
     }
@@ -239,33 +318,47 @@ export default function CameraPanel() {
       if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
     }
 
-    setCameraState('OFF');
     setFps(0);
     setDetectedLandmarksCount(0);
     setDeviceLabel('');
+    setLatestPrediction(null);
+    setPredictionError(null);
     lastVideoTimeRef.current = -1;
-    console.log('[Webcam] Camera stopped and resources released.');
   }, []);
+
+  /**
+   * Stops camera stream on explicit user action and resets UI state to OFF
+   */
+  const stopCamera = useCallback(() => {
+    console.log('[Webcam] User initiated Stop Camera.');
+    releaseCameraResources();
+    setCameraState('OFF');
+    onPredictionUpdateRef.current?.(null);
+    onCameraStatusChangeRef.current?.('OFF');
+    console.log('[Webcam] Camera stopped and resources released.');
+  }, [releaseCameraResources]);
 
   /**
    * Starts camera on explicit user button click
    */
   const startCamera = async () => {
+    console.log('[Webcam] Start Camera button clicked. Requesting camera access...');
     setErrorMessage('');
 
     // 1. Verify browser mediaDevices support
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      const unsupportedMsg =
+        'Camera API is not supported in this browser. Please use Google Chrome, Microsoft Edge, or Safari over HTTPS or localhost.';
+      console.error('[Webcam]', unsupportedMsg);
       setCameraState('NOT_SUPPORTED');
-      setErrorMessage(
-        'Camera API is not supported in this browser. Please use Google Chrome, Microsoft Edge, or Safari over HTTPS or localhost.'
-      );
+      setErrorMessage(unsupportedMsg);
       return;
     }
 
     setCameraState('REQUESTING_PERMISSION');
 
     try {
-      // Pre-initialize MediaPipe in parallel
+      // Pre-initialize MediaPipe vision runtime in parallel
       initPoseLandmarker().catch((e) => console.warn('[MediaPipe] Preload warning:', e));
 
       // 2. Explicitly prefer built-in front-facing camera with ideal resolution
@@ -287,10 +380,10 @@ export default function CameraPanel() {
       const selectedLabel = videoTrack?.label || 'Front-Facing Camera';
       const trackSettings = videoTrack?.getSettings ? videoTrack.getSettings() : {};
       setDeviceLabel(selectedLabel);
-      console.log(`[Webcam] Selected video device: "${selectedLabel}"`);
-      console.log('[Webcam] Track settings:', trackSettings);
+      console.log(`[Webcam] getUserMedia granted! Selected device: "${selectedLabel}"`);
+      console.log('[Webcam] Video track settings:', trackSettings);
 
-      // 4. Assign MediaStream to the actual video element
+      // 4. Assign MediaStream to the video element
       const video = videoRef.current;
       if (!video) {
         throw new Error('Video element reference is not mounted in DOM.');
@@ -301,75 +394,81 @@ export default function CameraPanel() {
       video.autoplay = true;
       video.srcObject = mediaStream;
 
-      // 5. Wait for loadedmetadata and call video.play()
-      const onMetadataLoaded = async () => {
+      // 5. Activate video stream and start pose estimation render loop
+      const activateStream = () => {
+        if (!streamRef.current) return;
         console.log(
-          `[Webcam] loadedmetadata event fired: dimensions ${video.videoWidth}x${video.videoHeight}, readyState: ${video.readyState}`
+          `[Webcam] Video ready: ${video.videoWidth}x${video.videoHeight}, readyState: ${video.readyState}`
         );
-        setVideoResolution({ width: video.videoWidth, height: video.videoHeight });
-
-        try {
-          await video.play();
-          console.log(
-            `[Webcam] video.play() started successfully. Actual dimensions: ${video.videoWidth}x${video.videoHeight}`
-          );
-
-          if (video.videoWidth > 0 && video.videoHeight > 0) {
-            setCameraState('ACTIVE');
-            isRunningRef.current = true;
-            animFrameIdRef.current = requestAnimationFrame(renderFrameLoop);
-          } else {
-            console.warn('[Webcam] Video dimensions still 0 after play(), waiting for canplay...');
-          }
-        } catch (playErr) {
-          console.error('[Webcam] video.play() failed:', playErr);
-          setCameraState('ERROR');
-          setErrorMessage(
-            `Video playback failed: ${playErr.message || 'Browser prevented video playback. Please click to interact.'}`
-          );
-          stopCamera();
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          setVideoResolution({ width: video.videoWidth, height: video.videoHeight });
+        }
+        setCameraState('ACTIVE');
+        isRunningRef.current = true;
+        onCameraStatusChangeRef.current?.('ACTIVE');
+        if (!animFrameIdRef.current) {
+          animFrameIdRef.current = requestAnimationFrame(renderFrameLoop);
         }
       };
 
-      if (video.readyState >= 1 && video.videoWidth > 0) {
-        await onMetadataLoaded();
-      } else {
-        video.onloadedmetadata = onMetadataLoaded;
+      video.onloadedmetadata = activateStream;
+      video.oncanplay = activateStream;
+      video.onplaying = activateStream;
+
+      // Start playback directly from user gesture
+      try {
+        await video.play();
+        console.log(
+          `[Webcam] video.play() resolved. Dimensions: ${video.videoWidth}x${video.videoHeight}, readyState: ${video.readyState}`
+        );
+      } catch (playErr) {
+        console.warn('[Webcam] Immediate video.play() returned promise warning, awaiting metadata:', playErr);
+      }
+
+      if (video.readyState >= 2 || video.videoWidth > 0) {
+        activateStream();
       }
     } catch (err) {
-      console.error('[Webcam] getUserMedia error:', err);
+      console.error('[Webcam] getUserMedia or video initialization error:', err);
+      releaseCameraResources();
+      onPredictionUpdateRef.current?.(null);
+      onCameraStatusChangeRef.current?.('OFF');
+
+      let userErrorMsg = err?.message || 'An unexpected error occurred while accessing the webcam.';
+      let nextState = 'ERROR';
+
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        setCameraState('PERMISSION_DENIED');
-        setErrorMessage(
-          'Webcam permission was denied. Please click the camera/lock icon in your browser address bar to allow camera access, then retry.'
-        );
+        nextState = 'PERMISSION_DENIED';
+        userErrorMsg =
+          'Webcam permission was denied. Please click the camera/lock icon in your browser address bar to allow camera access, then retry.';
       } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        setCameraState('ERROR');
-        setErrorMessage('No camera device was detected on your system.');
+        nextState = 'ERROR';
+        userErrorMsg = 'No camera device was detected on your system.';
       } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-        setCameraState('ERROR');
-        setErrorMessage(
-          'Camera is currently in use by another application (e.g. FaceTime, Zoom, or another browser window).'
-        );
+        nextState = 'ERROR';
+        userErrorMsg =
+          'Camera is currently in use by another application (e.g. FaceTime, Zoom, or another browser window).';
       } else if (err.name === 'OverconstrainedError') {
-        setCameraState('ERROR');
-        setErrorMessage(
-          'The requested camera resolution or facingMode is not supported by your camera hardware.'
-        );
-      } else {
-        setCameraState('ERROR');
-        setErrorMessage(err.message || 'An unexpected error occurred while accessing the webcam.');
+        nextState = 'ERROR';
+        userErrorMsg =
+          'The requested camera resolution or facingMode is not supported by your camera hardware.';
       }
-      stopCamera();
+
+      setCameraState(nextState);
+      setErrorMessage(userErrorMsg);
     }
   };
 
   /**
-   * Component cleanup on unmount
+   * Component cleanup ONLY on unmount
    */
   useEffect(() => {
     return () => {
-      stopCamera();
+      console.log('[CameraPanel] Component unmounting, cleaning up all camera & MediaPipe resources...');
+      releaseCameraResources();
+      onPredictionUpdateRef.current?.(null);
+      onCameraStatusChangeRef.current?.('OFF');
+
       if (poseLandmarkerRef.current) {
         try {
           poseLandmarkerRef.current.close();
@@ -380,7 +479,7 @@ export default function CameraPanel() {
       }
       initPromiseRef.current = null;
     };
-  }, [stopCamera]);
+  }, [releaseCameraResources]);
 
   return (
     <div className="card-panel" role="region" aria-label="Camera and Vision Feed Panel">
@@ -434,7 +533,20 @@ export default function CameraPanel() {
         */}
         <div
           className="camera-live-wrapper"
-          style={{ display: cameraState === 'ACTIVE' ? 'flex' : 'none' }}
+          style={
+            cameraState === 'ACTIVE'
+              ? { display: 'flex' }
+              : {
+                  position: 'absolute',
+                  top: 0,
+                  left: 0,
+                  width: '100%',
+                  height: '100%',
+                  opacity: 0,
+                  pointerEvents: 'none',
+                  zIndex: -1,
+                }
+          }
         >
           {/* Live Video Element */}
           <video
@@ -497,6 +609,43 @@ export default function CameraPanel() {
                     : 'Loading pose model...'}
                 </span>
               </span>
+
+              {/* Live FastAPI Fall Classification Verdict */}
+              {latestPrediction ? (
+                <span
+                  className="camera-live-badge"
+                  style={{
+                    backgroundColor: latestPrediction.fall_detected
+                      ? 'rgba(239, 68, 68, 0.95)'
+                      : 'rgba(16, 185, 129, 0.95)',
+                    color: '#ffffff',
+                    fontWeight: 600,
+                    border: latestPrediction.fall_detected
+                      ? '1px solid rgba(248, 113, 113, 0.8)'
+                      : '1px solid rgba(52, 211, 153, 0.8)',
+                  }}
+                >
+                  <Activity size={12} aria-hidden="true" />
+                  <span>
+                    {latestPrediction.fall_detected
+                      ? `FALL DETECTED (${Math.round((latestPrediction.confidence ?? 0) * 100)}%)`
+                      : `SAFE / NORMAL (${Math.round((latestPrediction.confidence ?? 0) * 100)}%)`}
+                  </span>
+                </span>
+              ) : predictionError ? (
+                <span
+                  className="camera-live-badge"
+                  style={{
+                    backgroundColor: 'rgba(245, 158, 11, 0.95)',
+                    color: '#ffffff',
+                    border: '1px solid rgba(251, 191, 36, 0.8)',
+                  }}
+                  title={predictionError}
+                >
+                  <AlertTriangle size={12} aria-hidden="true" />
+                  <span>FastAPI Standby</span>
+                </span>
+              ) : null}
             </div>
           </div>
         </div>
@@ -650,7 +799,24 @@ export default function CameraPanel() {
         </div>
 
         <div style={{ color: 'var(--text-muted)' }}>
-          <em>Note: Real fall classifier model training pending Phase 2. No live alarm claimed.</em>
+          {cameraState === 'ACTIVE' && latestPrediction ? (
+            <span>
+              <strong style={{ color: latestPrediction.fall_detected ? '#f87171' : '#34d399' }}>
+                {latestPrediction.fall_detected ? 'Fall Alert Active' : 'Normal Posture'}
+              </strong>
+              {' '}&bull; FastAPI RF Model &bull; Confidence:{' '}
+              <strong>{Math.round((latestPrediction.confidence ?? 0) * 100)}%</strong>
+              {' '}&bull; Fall Prob:{' '}
+              <strong>{Math.round((latestPrediction.fall_probability ?? 0) * 100)}%</strong>
+              {' '}&bull; 47 Features on Server
+            </span>
+          ) : cameraState === 'ACTIVE' && predictionError ? (
+            <span style={{ color: '#fbbf24' }}>
+              FastAPI standby ({predictionError}). Ensure backend is running at http://localhost:8000.
+            </span>
+          ) : (
+            <em>Trained Random Forest model loaded on FastAPI. Start camera to run real-time inference.</em>
+          )}
         </div>
       </div>
     </div>

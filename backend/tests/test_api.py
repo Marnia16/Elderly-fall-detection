@@ -65,8 +65,14 @@ def test_root_endpoint():
     assert "/docs" in data["documentation"]
 
 
-def test_health_check_without_model():
+def test_health_check_without_model(monkeypatch, tmp_path):
     """Verify that health check succeeds when no trained model exists."""
+    from app.routes import predict
+    monkeypatch.setattr(predict, "MODEL_DIR", tmp_path / "empty_models")
+    predict._cached_model = None
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
     response = client.get("/api/health")
     assert response.status_code == 200
     data = response.json()
@@ -80,11 +86,17 @@ def test_health_check_without_model():
     assert alias_response.json()["model_loaded"] is False
 
 
-def test_predict_endpoint_valid_landmarks_model_not_ready():
+def test_predict_endpoint_valid_landmarks_model_not_ready(monkeypatch, tmp_path):
     """
     Verify that predict endpoint accepts 33 valid MediaPipe landmarks,
     extracts all 47 features, and explicitly returns model_not_ready.
     """
+    from app.routes import predict
+    monkeypatch.setattr(predict, "MODEL_DIR", tmp_path / "empty_models")
+    predict._cached_model = None
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
     payload = {
         "timestamp": "2026-10-12T12:00:00Z",
         "frame_id": 101,
@@ -141,8 +153,14 @@ def test_predict_endpoint_rejects_invalid_visibility():
     assert response.status_code == 422
 
 
-def test_predict_status():
+def test_predict_status(monkeypatch, tmp_path):
     """Verify prediction pipeline status reporting."""
+    from app.routes import predict
+    monkeypatch.setattr(predict, "MODEL_DIR", tmp_path / "empty_models")
+    predict._cached_model = None
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
     response = client.get("/api/predict/status")
     assert response.status_code == 200
     data = response.json()
@@ -150,6 +168,30 @@ def test_predict_status():
     assert data["status"] == "model_not_ready"
     assert data["expected_landmarks"] == 33
     assert data["features_count"] == 47
+
+
+def test_predict_endpoint_with_trained_model():
+    """Verify prediction pipeline with real trained RandomForest model artifact."""
+    from app.routes import predict
+    predict._cached_model = None
+    predict._cached_model_path = None
+    predict._cached_model_mtime = None
+
+    payload = {
+        "timestamp": "2026-10-15T12:00:00Z",
+        "frame_id": 202,
+        "patient_id": "patient-001",
+        "landmarks": make_landmarks(33),
+    }
+    response = client.post("/api/predict", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["model_loaded"] is True
+    assert data["features_extracted"] == 47
+    assert data["status"] == "ok"
+    assert isinstance(data["fall_detected"], bool)
+    assert 0.0 <= data["confidence"] <= 1.0
+    assert 0.0 <= data["fall_probability"] <= 1.0
 
 
 def test_feature_schema_endpoint():
