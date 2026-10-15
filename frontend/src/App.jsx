@@ -1,0 +1,226 @@
+import React, { useState, useCallback, useEffect } from 'react';
+import Header from './components/Header';
+import MetricCard from './components/MetricCard';
+import CameraPanel from './components/CameraPanel';
+import FallStatusCard from './components/FallStatusCard';
+import ActiveAlertBanner from './components/ActiveAlertBanner';
+import AnalyticsPanel from './components/AnalyticsPanel';
+import IncidentLog from './components/IncidentLog';
+import AlertHistory from './components/AlertHistory';
+import SystemInfo from './components/SystemInfo';
+import {
+  Camera,
+  Activity,
+  UserCheck,
+  Cpu,
+  AlertTriangle,
+} from 'lucide-react';
+import {
+  MOCK_DISCLAIMER_TEXT,
+  MOCK_ROOM_INFO,
+} from './mock/mockData';
+import { fetchAlerts, fetchAlertAnalytics } from './config/api';
+
+export default function App() {
+  const [livePrediction, setLivePrediction] = useState(null);
+  const [apiError, setApiError] = useState(null);
+  const [cameraActive, setCameraActive] = useState(false);
+  const [activeAlerts, setActiveAlerts] = useState([]);
+  const [analyticsData, setAnalyticsData] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const refreshAlertsAndAnalytics = useCallback(() => {
+    fetchAlerts({ status: 'ACTIVE', limit: 10 })
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setActiveAlerts(data);
+        }
+      })
+      .catch(() => {});
+
+    fetchAlertAnalytics()
+      .then((data) => {
+        if (data && typeof data.total_incidents === 'number') {
+          setAnalyticsData(data);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Poll alerts and analytics periodically (every 5s)
+  useEffect(() => {
+    refreshAlertsAndAnalytics();
+    const interval = setInterval(refreshAlertsAndAnalytics, 5000);
+    return () => clearInterval(interval);
+  }, [refreshAlertsAndAnalytics, refreshKey]);
+
+  const handlePredictionUpdate = useCallback((prediction) => {
+    setLivePrediction(prediction);
+    // If a fall was confirmed or incident created, trigger immediate refresh
+    if (prediction && prediction.fall_confirmed) {
+      setRefreshKey((prev) => prev + 1);
+    }
+  }, []);
+
+  const handlePredictionError = useCallback((error) => {
+    setApiError(error);
+  }, []);
+
+  const handleCameraStatusChange = useCallback((status) => {
+    setCameraActive(status === 'ACTIVE');
+  }, []);
+
+  const handleAlertStateChanged = useCallback(() => {
+    setRefreshKey((prev) => prev + 1);
+    refreshAlertsAndAnalytics();
+  }, [refreshAlertsAndAnalytics]);
+
+  const isConfirmedFall = Boolean(livePrediction?.fall_confirmed || livePrediction?.fall_detected);
+
+  return (
+    <div className="app-container">
+      {/* Top Navigation & Live Telemetry Header */}
+      <Header
+        cameraActive={cameraActive}
+        isLiveStreaming={Boolean(cameraActive && livePrediction)}
+      />
+
+      {/* Active Persistent Incident Emergency Banner (audible siren + acknowledge/resolve) */}
+      <ActiveAlertBanner
+        activeAlerts={activeAlerts}
+        livePrediction={livePrediction}
+        onAlertUpdated={handleAlertStateChanged}
+      />
+
+      {/* Prominent Demonstration & Simulation Disclaimer */}
+      <div className="disclaimer-banner" role="status">
+        <div className="disclaimer-content">
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>
+            {cameraActive && livePrediction
+              ? 'Live Inference Active: Streaming 33 MediaPipe pose landmarks to FastAPI Random Forest model.'
+              : MOCK_DISCLAIMER_TEXT}
+          </span>
+        </div>
+        <span style={{ fontSize: '0.72rem', opacity: 0.85 }}>
+          {cameraActive && livePrediction
+            ? '[Live Prediction Mode]'
+            : '[Demonstration Foundation Mode]'}
+        </span>
+      </div>
+
+      {/* Main Dashboard Layout */}
+      <main className="main-content">
+        {/* Metric Overview Grid */}
+        <section className="metrics-grid" aria-label="System Metrics Overview">
+          <MetricCard
+            title="Camera Input"
+            value={cameraActive ? 'Active Stream' : 'Camera Off'}
+            subtitle={cameraActive ? 'Live Webcam (Front-Facing)' : 'Click Start Camera below'}
+            icon={Camera}
+            badge={cameraActive ? 'Live' : 'Standby'}
+          />
+
+          <MetricCard
+            title="Current Fall State"
+            value={
+              cameraActive && livePrediction
+                ? isConfirmedFall
+                  ? 'FALL CONFIRMED'
+                  : livePrediction.near_fall
+                  ? 'NEAR-FALL TILT'
+                  : 'Safe / Upright'
+                : cameraActive
+                ? 'Tracking Pose...'
+                : 'Safe / Upright'
+            }
+            subtitle={
+              cameraActive && livePrediction
+                ? isConfirmedFall
+                  ? `Fall prob: ${Math.round((livePrediction.fall_probability ?? 0) * 100)}%`
+                  : `Posture conf: ${Math.round((livePrediction.confidence ?? 0) * 100)}%`
+                : cameraActive
+                ? 'Streaming landmarks to FastAPI'
+                : 'FastAPI RF Model Ready'
+            }
+            icon={Activity}
+            badge={
+              cameraActive && livePrediction
+                ? isConfirmedFall
+                  ? 'CRITICAL ALERT'
+                  : livePrediction.near_fall
+                  ? 'Near-Fall Tilt'
+                  : 'Live ML Safe'
+                : 'Model Ready'
+            }
+          />
+
+          <MetricCard
+            title="Monitored Subject"
+            value={MOCK_ROOM_INFO.roomNumber}
+            subtitle={`Assigned: ${MOCK_ROOM_INFO.residentName}`}
+            icon={UserCheck}
+            badge="Room 204"
+          />
+
+          <MetricCard
+            title="ML Pipeline"
+            value="Random Forest"
+            subtitle="47 Server Features / MediaPipe"
+            icon={Cpu}
+            badge="FastAPI Interface"
+          />
+        </section>
+
+        {/* Primary Monitoring Viewport & Telemetry Grid */}
+        <section className="dashboard-grid">
+          {/* Left Column: Camera Viewport with MediaPipe & FastAPI Streaming */}
+          <CameraPanel
+            onPredictionUpdate={handlePredictionUpdate}
+            onPredictionError={handlePredictionError}
+            onCameraStatusChange={handleCameraStatusChange}
+          />
+
+          {/* Right Column: Fall Status & Recent Activity */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+            <FallStatusCard
+              livePrediction={livePrediction}
+              isLiveActive={cameraActive}
+              apiError={apiError}
+            />
+            <IncidentLog refreshTrigger={refreshKey} />
+          </div>
+        </section>
+
+        {/* Incident Analytics & 7-Day Trend Chart */}
+        <section style={{ marginTop: '1.5rem' }}>
+          <AnalyticsPanel
+            analyticsData={analyticsData}
+            onRefresh={handleAlertStateChanged}
+          />
+        </section>
+
+        {/* Historical Alert Audit Table with CSV Download & Print */}
+        <section style={{ marginTop: '1.5rem' }}>
+          <AlertHistory
+            refreshTrigger={refreshKey}
+            onIncidentChanged={handleAlertStateChanged}
+          />
+        </section>
+
+        {/* Academic Architecture & Specifications */}
+        <SystemInfo />
+      </main>
+
+      {/* Footer */}
+      <footer className="app-footer" role="contentinfo">
+        <div>
+          <strong>Elderly Fall Detection &amp; Alert System</strong> &bull; Full-Stack AI Telemetry Platform
+        </div>
+        <div>
+          React 18 &bull; Vite 5 &bull; MediaPipe Pose &bull; FastAPI &bull; SQLite &bull; Random Forest
+        </div>
+      </footer>
+    </div>
+  );
+}
